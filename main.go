@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -179,5 +180,100 @@ func receiverName(expr ast.Expr) string {
 		return receiverName(expr.X)
 	default:
 		return "?"
+	}
+}
+
+type ignoreRules []string
+
+func (rules *ignoreRules) add(pattern string) error {
+	if pattern == "" {
+		return fmt.Errorf("ignore 规则不能为空")
+	}
+	pattern = filepath.Clean(pattern)
+	if _, err := filepath.Match(pattern, ""); err != nil {
+		return fmt.Errorf("无效的 ignore 规则 %q: %w", pattern, err)
+	}
+	// Resolve patterns containing path separators against the working directory; match bare names at any level.
+	if strings.ContainsRune(pattern, filepath.Separator) || pattern == "." {
+		absolute, err := filepath.Abs(pattern)
+		if err != nil {
+			return err
+		}
+		pattern = absolute
+	}
+	*rules = append(*rules, pattern)
+	return nil
+}
+
+func (rules ignoreRules) matches(path string) bool {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	// Match ancestor directories so explicitly specified files follow the same ignore rules.
+	for current := absolute; ; current = filepath.Dir(current) {
+		for _, pattern := range rules {
+			candidate := current
+			if !filepath.IsAbs(pattern) {
+				candidate = filepath.Base(current)
+			}
+			if matched, _ := filepath.Match(pattern, candidate); matched {
+				return true
+			}
+		}
+		if filepath.Dir(current) == current {
+			return false
+		}
+	}
+}
+
+type finding struct {
+	path         string
+	line, column int
+	name         string
+	params       string
+}
+
+func writeFindings(out io.Writer, findings []finding, depth int) {
+	groups := make(map[string][]finding)
+	for _, item := range findings {
+		prefix := ""
+		if depth > 0 {
+			dir := filepath.ToSlash(filepath.Dir(item.path))
+			parts := strings.Split(dir, "/")
+			if len(parts) > depth {
+				parts = parts[:depth]
+			}
+			prefix = strings.Join(parts, "/")
+		}
+		groups[prefix] = append(groups[prefix], item)
+	}
+	prefixes := make([]string, 0, len(groups))
+	for prefix := range groups {
+		prefixes = append(prefixes, prefix)
+	}
+	sort.Strings(prefixes)
+	for index, prefix := range prefixes {
+		items := groups[prefix]
+		sort.Slice(items, func(i, j int) bool {
+			if items[i].path != items[j].path {
+				return items[i].path < items[j].path
+			}
+			if items[i].line != items[j].line {
+				return items[i].line < items[j].line
+			}
+			return items[i].column < items[j].column
+		})
+		indent := ""
+		if depth > 0 {
+			if index > 0 {
+				fmt.Fprintln(out)
+			}
+			fmt.Fprintf(out, "%s (%d 个函数)\n", prefix, len(items))
+			indent = "  "
+		}
+		for _, item := range items {
+			fmt.Fprintf(out, "%s%s:%d:%d: %s%s\n", indent, item.path, item.line, item.column, item.name, item.params)
+		}
 	}
 }
