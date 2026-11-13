@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"encoding/csv"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"go/ast"
@@ -13,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -24,7 +27,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("go-func-params-too-long-detector", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	minimum := flags.Int("min", 5, "报告参数数量大于等于此值的函数")
-	depth := flags.Int("group-depth", 1, "路径前缀分组深度，0 表示平铺输出")
+	depth := flags.Int("group-depth", 1, "文本输出的路径前缀分组深度，0 表示平铺输出")
+	output := flags.String("output", "text", "输出格式：text、json 或 csv；json 和 csv 始终平铺输出")
 	var ignored ignoreRules
 	flags.Func("ignore", "忽略路径或通配符模式，可重复指定；相对于当前工作目录", ignored.add)
 	flags.Usage = func() {
@@ -45,6 +49,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "错误: -group-depth 必须大于等于 0")
 		return 2
 	}
+	if *output != "text" && *output != "json" && *output != "csv" {
+		fmt.Fprintln(stderr, "错误: -output 必须是 text、json 或 csv")
+		return 2
+	}
 	cwd, err := os.Getwd()
 	if err != nil {
 		fmt.Fprintf(stderr, "错误: %v\n", err)
@@ -55,7 +63,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		paths = []string{"."}
 	}
 
-	var findings []finding
+	findings := make([]finding, 0)
 	failed := false
 	seen := make(map[string]bool)
 	reportError := func(err error) {
@@ -106,8 +114,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 				}
 				pos := fset.PositionFor(signature.Pos(), false)
 				findings = append(findings, finding{
-					path: displayPath, line: pos.Line, column: pos.Column,
-					name: name, params: strings.TrimPrefix(params.String(), "func"),
+					Path: displayPath, Line: pos.Line, Column: pos.Column,
+					Name: name, Params: strings.TrimPrefix(params.String(), "func"), ParameterCount: count,
 				})
 			}
 			return true
@@ -157,7 +165,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 			reportError(err)
 		}
 	}
-	writeFindings(stdout, findings, *depth)
+	if err := writeFindings(stdout, findings, *depth, *output); err != nil {
+		reportError(fmt.Errorf("写入输出失败: %w", err))
+	}
 	if failed {
 		return 2
 	}
@@ -228,18 +238,55 @@ func (rules ignoreRules) matches(path string) bool {
 }
 
 type finding struct {
-	path         string
-	line, column int
-	name         string
-	params       string
+	Path           string `json:"path"`
+	Line           int    `json:"line"`
+	Column         int    `json:"column"`
+	Name           string `json:"name"`
+	Params         string `json:"params"`
+	ParameterCount int    `json:"parameter_count"`
 }
 
-func writeFindings(out io.Writer, findings []finding, depth int) {
+func writeFindings(out io.Writer, findings []finding, depth int, output string) error {
+	sort.Slice(findings, func(i, j int) bool {
+		if findings[i].Path != findings[j].Path {
+			return findings[i].Path < findings[j].Path
+		}
+		if findings[i].Line != findings[j].Line {
+			return findings[i].Line < findings[j].Line
+		}
+		return findings[i].Column < findings[j].Column
+	})
+	switch output {
+	case "json":
+		encoder := json.NewEncoder(out)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(findings)
+	case "csv":
+		writer := csv.NewWriter(out)
+		if err := writer.Write([]string{"path", "line", "column", "name", "params", "parameter_count"}); err != nil {
+			return err
+		}
+		for _, item := range findings {
+			if err := writer.Write([]string{
+				item.Path, strconv.Itoa(item.Line), strconv.Itoa(item.Column),
+				item.Name, item.Params, strconv.Itoa(item.ParameterCount),
+			}); err != nil {
+				return err
+			}
+		}
+		writer.Flush()
+		return writer.Error()
+	default:
+		return writeTextFindings(out, findings, depth)
+	}
+}
+
+func writeTextFindings(out io.Writer, findings []finding, depth int) error {
 	groups := make(map[string][]finding)
 	for _, item := range findings {
 		prefix := ""
 		if depth > 0 {
-			dir := filepath.ToSlash(filepath.Dir(item.path))
+			dir := filepath.ToSlash(filepath.Dir(item.Path))
 			parts := strings.Split(dir, "/")
 			if len(parts) > depth {
 				parts = parts[:depth]
@@ -255,25 +302,23 @@ func writeFindings(out io.Writer, findings []finding, depth int) {
 	sort.Strings(prefixes)
 	for index, prefix := range prefixes {
 		items := groups[prefix]
-		sort.Slice(items, func(i, j int) bool {
-			if items[i].path != items[j].path {
-				return items[i].path < items[j].path
-			}
-			if items[i].line != items[j].line {
-				return items[i].line < items[j].line
-			}
-			return items[i].column < items[j].column
-		})
 		indent := ""
 		if depth > 0 {
 			if index > 0 {
-				fmt.Fprintln(out)
+				if _, err := fmt.Fprintln(out); err != nil {
+					return err
+				}
 			}
-			fmt.Fprintf(out, "%s (%d 个函数)\n", prefix, len(items))
+			if _, err := fmt.Fprintf(out, "%s (%d 个函数)\n", prefix, len(items)); err != nil {
+				return err
+			}
 			indent = "  "
 		}
 		for _, item := range items {
-			fmt.Fprintf(out, "%s%s:%d:%d: %s%s\n", indent, item.path, item.line, item.column, item.name, item.params)
+			if _, err := fmt.Fprintf(out, "%s%s:%d:%d: %s%s\n", indent, item.Path, item.Line, item.Column, item.Name, item.Params); err != nil {
+				return err
+			}
 		}
 	}
+	return nil
 }
